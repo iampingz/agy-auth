@@ -1,0 +1,583 @@
+#!/usr/bin/env python3
+"""
+Antigravity Profile Switcher (agy-auth)
+Production-grade CLI tool to manage, switch, and secure Antigravity accounts.
+"""
+
+import sys
+import os
+import re
+import json
+import time
+import base64
+import shutil
+import argparse
+import subprocess
+from datetime import datetime
+
+GEMINI_DIR = os.path.expanduser("~/.gemini/antigravity-cli")
+TOKEN_FILE = os.path.join(GEMINI_DIR, "antigravity-oauth-token")
+PROFILES_DIR = os.path.join(GEMINI_DIR, "profiles")
+
+NAME_REGEX = re.compile(r"^[a-zA-Z0-9_\-\.]+$")
+
+def validate_name(name):
+    if not name or not NAME_REGEX.match(name) or name in (".", ".."):
+        print(f"\033[1;31mError: Invalid profile name '{name}'. Use only letters, numbers, hyphens, and underscores.\033[0m")
+        sys.exit(1)
+
+def ensure_profiles_dir():
+    if not os.path.isdir(PROFILES_DIR):
+        os.makedirs(PROFILES_DIR, mode=0o700, exist_ok=True)
+    else:
+        try:
+            os.chmod(PROFILES_DIR, 0o700)
+        except OSError:
+            pass
+
+def secure_file(path):
+    """Enforce strict 0600 permission on token files for security."""
+    if os.path.isfile(path):
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+def parse_jwt(token_str):
+    try:
+        parts = token_str.split(".")
+        if len(parts) < 2:
+            return {}
+        payload_b64 = parts[1]
+        payload_b64 += "=" * ((4 - len(payload_b64) % 4) % 4)
+        payload_json = base64.urlsafe_b64decode(payload_b64.encode("utf-8")).decode("utf-8")
+        return json.loads(payload_json)
+    except Exception:
+        return {}
+
+def inspect_token_file(token_path):
+    """Returns dict with email, exp, is_expired, expiry_str."""
+    if not os.path.isfile(token_path):
+        return {"exists": False, "email": None, "is_expired": True, "expiry_str": "No Token"}
+    try:
+        with open(token_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        id_token = data.get("id_token")
+        if not id_token:
+            return {"exists": True, "email": "Unknown (No id_token)", "is_expired": False, "expiry_str": "Unknown"}
+        
+        jwt_data = parse_jwt(id_token)
+        email = jwt_data.get("email") or "Unknown"
+        exp = jwt_data.get("exp")
+        
+        if exp:
+            now = time.time()
+            is_expired = now > exp
+            exp_dt = datetime.fromtimestamp(exp).strftime("%Y-%m-%d %H:%M")
+            expiry_str = f"Expired at {exp_dt}" if is_expired else f"Expires at {exp_dt}"
+        else:
+            is_expired = False
+            expiry_str = "No Expiry Field"
+
+        return {
+            "exists": True,
+            "email": email,
+            "exp": exp,
+            "is_expired": is_expired,
+            "expiry_str": expiry_str
+        }
+    except Exception as e:
+        return {"exists": True, "email": f"Corrupted Token ({e})", "is_expired": True, "expiry_str": "Error"}
+
+def auto_backup_current():
+    ensure_profiles_dir()
+    info = inspect_token_file(TOKEN_FILE)
+    current_email = info.get("email")
+    if not current_email or "Unknown" in current_email or "Corrupted" in current_email:
+        return
+
+    # Check if this token is already saved under any profile
+    for p in os.listdir(PROFILES_DIR):
+        p_path = os.path.join(PROFILES_DIR, p, "antigravity-oauth-token")
+        p_info = inspect_token_file(p_path)
+        if p_info.get("email") == current_email:
+            return
+
+    auto_name = current_email.split("@")[0]
+    validate_name(auto_name)
+    target_dir = os.path.join(PROFILES_DIR, auto_name)
+    os.makedirs(target_dir, mode=0o700, exist_ok=True)
+    dest_token = os.path.join(target_dir, "antigravity-oauth-token")
+    shutil.copy2(TOKEN_FILE, dest_token)
+    secure_file(dest_token)
+    print(f"\033[1;33m[Auto-Backup] Current active account saved as profile '{auto_name}'.\033[0m")
+
+def cmd_current(args):
+    info = inspect_token_file(TOKEN_FILE)
+    if info.get("exists") and info.get("email"):
+        status_tag = "\033[1;31m[EXPIRED / NEEDS REFRESH]\033[0m" if info["is_expired"] else "\033[1;32m[VALID]\033[0m"
+        print(f"Current logged-in account: \033[1;34m{info['email']}\033[0m {status_tag}")
+        print(f"Token status: {info['expiry_str']}")
+    else:
+        print("\033[1;33mNo active Antigravity session or token not found.\033[0m")
+
+def cmd_list(args):
+    ensure_profiles_dir()
+    current_info = inspect_token_file(TOKEN_FILE)
+    current_email = current_info.get("email")
+    profiles = sorted(os.listdir(PROFILES_DIR))
+    
+    print("\n" + "=" * 70)
+    print(f" \033[1mAntigravity Profiles Directory\033[0m ({PROFILES_DIR})")
+    print("=" * 70)
+    
+    if not profiles:
+        print("  (No profiles saved yet. Run 'agy-auth new <name>' to create one)")
+    else:
+        for idx, p in enumerate(profiles, 1):
+            p_path = os.path.join(PROFILES_DIR, p, "antigravity-oauth-token")
+            p_info = inspect_token_file(p_path)
+            is_active = (current_email and p_info.get("email") == current_email)
+            
+            prefix = "\033[1;32m* \033[0m" if is_active else "  "
+            active_badge = " \033[1;32m(ACTIVE)\033[0m" if is_active else ""
+            status_color = "\033[31m" if p_info.get("is_expired") else "\033[32m"
+            status_text = f"{status_color}[{'EXP' if p_info.get('is_expired') else 'OK'}]\033[0m"
+            
+            email = p_info.get("email") or "Unknown"
+            print(f"{prefix}[{idx}] \033[1m{p:<15}\033[0m {status_text} {email:<30}{active_badge}")
+            
+    print("=" * 70)
+    if current_email:
+        print(f"Current active session: \033[1;34m{current_email}\033[0m\n")
+    else:
+        print("No active session currently loaded.\n")
+
+def cmd_new(args):
+    ensure_profiles_dir()
+    name = args.name.strip()
+    validate_name(name)
+    target_dir = os.path.join(PROFILES_DIR, name)
+
+    if os.path.isdir(target_dir):
+        print(f"\033[1;31mError: Profile '{name}' already exists!\033[0m")
+        print(f"Use 'agy-auth remove {name}' to delete it first or choose another name.")
+        sys.exit(1)
+
+    # 1. Backup current session
+    auto_backup_current()
+
+    # 2. Temporarily remove token file to trigger fresh login
+    if os.path.isfile(TOKEN_FILE):
+        os.remove(TOKEN_FILE)
+
+    print(f"\n\033[1;34m>>> Launching Antigravity authentication for profile '{name}'...\033[0m")
+    print("Please complete login in your browser/terminal.\n")
+
+    # 3. Launch agy
+    try:
+        subprocess.run(["agy"], check=False)
+    except FileNotFoundError:
+        print("\033[1;31mError: 'agy' command not found in PATH.\033[0m")
+        sys.exit(1)
+
+    # 4. Check if token was created
+    info = inspect_token_file(TOKEN_FILE)
+    if not info.get("exists") or not info.get("email"):
+        print(f"\n\033[1;31mLogin was cancelled or failed. Profile '{name}' was not created.\033[0m")
+        sys.exit(1)
+
+    # 5. Save into profile with strict 0600 permissions
+    os.makedirs(target_dir, mode=0o700, exist_ok=True)
+    dest_token = os.path.join(target_dir, "antigravity-oauth-token")
+    shutil.copy2(TOKEN_FILE, dest_token)
+    secure_file(dest_token)
+    secure_file(TOKEN_FILE)
+    
+    print("\n" + "=" * 65)
+    print(f"\033[1;32m✓ Profile '{name}' successfully created and active!\033[0m")
+    print(f"Account: \033[1;34m{info['email']}\033[0m")
+    print("=" * 65 + "\n")
+
+def cmd_save(args):
+    ensure_profiles_dir()
+    name = args.name.strip()
+    validate_name(name)
+    if not os.path.isfile(TOKEN_FILE):
+        print(f"\033[1;31mError: No current active token found at {TOKEN_FILE}\033[0m")
+        sys.exit(1)
+        
+    info = inspect_token_file(TOKEN_FILE)
+    target_dir = os.path.join(PROFILES_DIR, name)
+    os.makedirs(target_dir, mode=0o700, exist_ok=True)
+    
+    dest_token = os.path.join(target_dir, "antigravity-oauth-token")
+    shutil.copy2(TOKEN_FILE, dest_token)
+    secure_file(dest_token)
+        
+    print(f"\033[1;32m✓ Profile '{name}' saved successfully!\033[0m")
+    if info.get("email"):
+        print(f"Linked Account: \033[1;34m{info['email']}\033[0m")
+
+def cmd_rename(args):
+    ensure_profiles_dir()
+    old_name = args.old_name.strip()
+    new_name = args.new_name.strip()
+    validate_name(old_name)
+    validate_name(new_name)
+    
+    old_dir = os.path.join(PROFILES_DIR, old_name)
+    new_dir = os.path.join(PROFILES_DIR, new_name)
+
+    if not os.path.isdir(old_dir):
+        print(f"\033[1;31mError: Profile '{old_name}' does not exist.\033[0m")
+        sys.exit(1)
+
+    if os.path.isdir(new_dir):
+        print(f"\033[1;31mError: Target profile name '{new_name}' already exists.\033[0m")
+        sys.exit(1)
+
+    os.rename(old_dir, new_dir)
+    print(f"\033[1;32m✓ Profile '{old_name}' renamed to '{new_name}' successfully!\033[0m")
+
+def cmd_use(args):
+    ensure_profiles_dir()
+    profiles = sorted(os.listdir(PROFILES_DIR))
+    
+    if not profiles:
+        print("\033[1;33mNo profiles found. Run 'agy-auth new <name>' to create one first.\033[0m")
+        sys.exit(1)
+
+    name = args.name.strip() if args.name else None
+
+    # Interactive selector if name is not provided
+    if not name:
+        current_info = inspect_token_file(TOKEN_FILE)
+        current_email = current_info.get("email")
+        print("\n\033[1mSelect a profile to switch to:\033[0m")
+        for idx, p in enumerate(profiles, 1):
+            p_path = os.path.join(PROFILES_DIR, p, "antigravity-oauth-token")
+            p_info = inspect_token_file(p_path)
+            is_active = (current_email and p_info.get("email") == current_email)
+            badge = " \033[1;32m(ACTIVE)\033[0m" if is_active else ""
+            print(f"  \033[1m[{idx}]\033[0m {p:<15} ({p_info.get('email', 'Unknown')}){badge}")
+        
+        try:
+            choice = input("\nEnter number or profile name (or 'q' to cancel): ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelled.")
+            sys.exit(0)
+            
+        if not choice or choice.lower() == 'q':
+            print("Cancelled.")
+            sys.exit(0)
+        if choice.isdigit() and 1 <= int(choice) <= len(profiles):
+            name = profiles[int(choice) - 1]
+        else:
+            name = choice
+
+    validate_name(name)
+    profile_dir = os.path.join(PROFILES_DIR, name)
+    profile_token = os.path.join(profile_dir, "antigravity-oauth-token")
+    
+    if not os.path.isfile(profile_token):
+        print(f"\033[1;31mError: Profile '{name}' does not exist.\033[0m")
+        print("Run 'agy-auth list' to see available profiles.")
+        sys.exit(1)
+        
+    auto_backup_current()
+
+    # Apply profile
+    shutil.copy2(profile_token, TOKEN_FILE)
+    secure_file(TOKEN_FILE)
+    
+    info = inspect_token_file(TOKEN_FILE)
+    print(f"\033[1;32m✓ Switched successfully to profile '{name}'!\033[0m")
+    if info.get("email"):
+        status_tag = " \033[1;31m(Expired / will refresh on next request)\033[0m" if info["is_expired"] else ""
+        print(f"Active Account: \033[1;34m{info['email']}\033[0m{status_tag}")
+
+def cmd_remove(args):
+    ensure_profiles_dir()
+    name = args.name.strip()
+    validate_name(name)
+    profile_dir = os.path.join(PROFILES_DIR, name)
+    
+    if not os.path.isdir(profile_dir):
+        print(f"\033[1;31mError: Profile '{name}' does not exist.\033[0m")
+        sys.exit(1)
+
+    # Check if active
+    p_path = os.path.join(profile_dir, "antigravity-oauth-token")
+    p_info = inspect_token_file(p_path)
+    current_info = inspect_token_file(TOKEN_FILE)
+    
+    if current_info.get("email") and p_info.get("email") == current_info.get("email"):
+        print(f"\033[1;33mWarning: Profile '{name}' is currently ACTIVE.\033[0m")
+        if not getattr(args, "force", False):
+            try:
+                confirm = input("Are you sure you want to delete the active profile? [y/N]: ").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                print("\nCancelled.")
+                sys.exit(0)
+            if confirm not in ("y", "yes"):
+                print("Cancelled deletion.")
+                sys.exit(0)
+
+    shutil.rmtree(profile_dir)
+    print(f"\033[1;32m✓ Profile '{name}' removed successfully.\033[0m")
+
+def cmd_logout(args):
+    if os.path.isfile(TOKEN_FILE):
+        os.remove(TOKEN_FILE)
+        print("\033[1;32m✓ Active session cleared (Logged out). Next 'agy' run will ask to log in.\033[0m")
+    else:
+        print("No active session to clear.")
+
+def cmd_export(args):
+    ensure_profiles_dir()
+    profiles = sorted(os.listdir(PROFILES_DIR))
+    if not profiles:
+        print("\033[1;33mNo profiles found to export.\033[0m")
+        sys.exit(1)
+
+    target_profiles = []
+    if args.name:
+        name = args.name.strip()
+        validate_name(name)
+        p_dir = os.path.join(PROFILES_DIR, name)
+        if not os.path.isdir(p_dir):
+            print(f"\033[1;31mError: Profile '{name}' does not exist.\033[0m")
+            sys.exit(1)
+        target_profiles.append(name)
+    else:
+        target_profiles = profiles
+
+    output_path = args.output
+    if not output_path:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if args.name:
+            output_path = f"agy-profile-{args.name}-{timestamp}.json"
+        else:
+            output_path = f"agy-profiles-backup-{timestamp}.json"
+
+    export_data = {
+        "version": 1,
+        "exported_at": datetime.now().isoformat(),
+        "profiles": {}
+    }
+
+    count = 0
+    for p in target_profiles:
+        p_token_path = os.path.join(PROFILES_DIR, p, "antigravity-oauth-token")
+        if os.path.isfile(p_token_path):
+            try:
+                with open(p_token_path, "r", encoding="utf-8") as f:
+                    token_content = json.load(f)
+                info = inspect_token_file(p_token_path)
+                export_data["profiles"][p] = {
+                    "token": token_content,
+                    "email": info.get("email")
+                }
+                count += 1
+            except Exception as e:
+                print(f"\033[1;33mWarning: Failed to read token for profile '{p}': {e}\033[0m")
+
+    if not export_data["profiles"]:
+        print("\033[1;31mError: No valid profile tokens found to export.\033[0m")
+        sys.exit(1)
+
+    try:
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(export_data, f, indent=2)
+        secure_file(output_path)
+        print("\n" + "=" * 65)
+        print(f"\033[1;32m✓ Successfully exported {count} profile(s) to:\033[0m {output_path}")
+        print("Profiles included:")
+        for p, p_data in export_data["profiles"].items():
+            print(f"  • \033[1m{p:<15}\033[0m ({p_data.get('email', 'Unknown')})")
+        print("=" * 65 + "\n")
+    except Exception as e:
+        print(f"\033[1;31mError writing export file: {e}\033[0m")
+        sys.exit(1)
+
+def cmd_import(args):
+    ensure_profiles_dir()
+    filepath = args.file.strip()
+    if not os.path.isfile(filepath):
+        print(f"\033[1;31mError: File '{filepath}' does not exist.\033[0m")
+        sys.exit(1)
+
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"\033[1;31mError: Invalid JSON file '{filepath}': {e}\033[0m")
+        sys.exit(1)
+
+    # Validate structure
+    profiles_data = {}
+    if isinstance(data, dict):
+        if "profiles" in data and isinstance(data["profiles"], dict):
+            # Standard agy-auth export format
+            profiles_data = data["profiles"]
+        elif "id_token" in data or "refresh_token" in data:
+            # Single raw token file import
+            import_name = args.as_name.strip() if args.as_name else None
+            if not import_name:
+                jwt_data = parse_jwt(data.get("id_token", ""))
+                email = jwt_data.get("email")
+                if email:
+                    import_name = email.split("@")[0]
+                else:
+                    import_name = "imported_profile"
+            profiles_data = {
+                import_name: {
+                    "token": data
+                }
+            }
+        else:
+            print(f"\033[1;31mError: Unrecognized profile format in '{filepath}'.\033[0m")
+            sys.exit(1)
+    else:
+        print(f"\033[1;31mError: Unexpected JSON content in '{filepath}'.\033[0m")
+        sys.exit(1)
+
+    # Filter if user specified a single profile to import from package
+    if args.name:
+        filter_name = args.name.strip()
+        if filter_name not in profiles_data:
+            print(f"\033[1;31mError: Profile '{filter_name}' not found in '{filepath}'.\033[0m")
+            print(f"Available profiles in file: {', '.join(profiles_data.keys())}")
+            sys.exit(1)
+        profiles_data = {filter_name: profiles_data[filter_name]}
+
+    imported_count = 0
+    print("\n" + "=" * 65)
+    print(f" \033[1mImporting Profiles from {filepath}\033[0m")
+    print("=" * 65)
+
+    for p_name, p_info in profiles_data.items():
+        dest_name = args.as_name.strip() if (args.as_name and len(profiles_data) == 1) else p_name
+        try:
+            validate_name(dest_name)
+        except SystemExit:
+            print(f"\033[1;31mSkipping invalid profile name '{dest_name}'.\033[0m")
+            continue
+
+        target_dir = os.path.join(PROFILES_DIR, dest_name)
+        token_content = p_info.get("token") if isinstance(p_info, dict) else p_info
+
+        if not isinstance(token_content, dict):
+            print(f"\033[1;33mSkipping '{dest_name}': invalid token data.\033[0m")
+            continue
+
+        if os.path.isdir(target_dir) and not getattr(args, "force", False):
+            print(f"\033[1;33mProfile '{dest_name}' already exists. Overwrite? [y/N]: \033[0m", end="")
+            try:
+                choice = input().strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                print("\nCancelled.")
+                sys.exit(0)
+            if choice not in ("y", "yes"):
+                print(f"Skipping profile '{dest_name}'.")
+                continue
+
+        os.makedirs(target_dir, mode=0o700, exist_ok=True)
+        dest_token = os.path.join(target_dir, "antigravity-oauth-token")
+        try:
+            with open(dest_token, "w", encoding="utf-8") as f:
+                json.dump(token_content, f, indent=2)
+            secure_file(dest_token)
+            
+            info = inspect_token_file(dest_token)
+            email_str = info.get("email") or "Unknown"
+            print(f"  \033[1;32m✓\033[0m Imported \033[1m{dest_name:<15}\033[0m ({email_str})")
+            imported_count += 1
+        except Exception as e:
+            print(f"  \033[1;31m✗\033[0m Failed to write profile '{dest_name}': {e}")
+
+    print("=" * 65)
+    print(f"\033[1;32mImport finished: {imported_count} profile(s) imported successfully.\033[0m\n")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Antigravity Profile Switcher CLI (agy-auth)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  agy-auth new work              # Create & login directly into 'work'
+  agy-auth use                   # Interactive menu to select profile
+  agy-auth use work              # Switch directly to 'work'
+  agy-auth list                  # View all profiles & token expiry status
+  agy-auth rename work office    # Rename profile
+  agy-auth current               # Show current active account
+  agy-auth remove old-profile    # Safely delete a profile
+  agy-auth export -o backup.json # Export all profiles to a JSON file
+  agy-auth export work           # Export only 'work' profile
+  agy-auth import backup.json    # Import profiles from JSON file
+"""
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # current
+    subparsers.add_parser("current", help="Show currently logged in user & token health")
+    
+    # list
+    subparsers.add_parser("list", help="List all profiles with status and expiry")
+    
+    # new
+    p_new = subparsers.add_parser("new", help="Add/login a new profile directly")
+    p_new.add_argument("name", help="Profile name (e.g. work, personal)")
+
+    # rename
+    p_rename = subparsers.add_parser("rename", help="Rename an existing profile")
+    p_rename.add_argument("old_name", help="Current profile name")
+    p_rename.add_argument("new_name", help="New profile name")
+
+    # save
+    p_save = subparsers.add_parser("save", help="Save current active session under a profile name")
+    p_save.add_argument("name", help="Profile name")
+
+    # use
+    p_use = subparsers.add_parser("use", help="Switch profile (interactive if name omitted)")
+    p_use.add_argument("name", nargs="?", default=None, help="Profile name (optional)")
+
+    # remove
+    p_remove = subparsers.add_parser("remove", help="Remove a saved profile")
+    p_remove.add_argument("name", help="Profile name to remove")
+    p_remove.add_argument("-f", "--force", action="store_true", help="Skip confirmation prompt")
+
+    # export
+    p_export = subparsers.add_parser("export", help="Export one or all profiles to a JSON file")
+    p_export.add_argument("name", nargs="?", default=None, help="Profile name to export (optional, exports all if omitted)")
+    p_export.add_argument("-o", "--output", default=None, help="Output JSON file path (optional)")
+
+    # import
+    p_import = subparsers.add_parser("import", help="Import profiles from a JSON file")
+    p_import.add_argument("file", help="Path to JSON file to import")
+    p_import.add_argument("--name", default=None, help="Import only a specific profile from package")
+    p_import.add_argument("--as-name", default=None, help="Rename imported profile")
+    p_import.add_argument("-f", "--force", action="store_true", help="Overwrite existing profiles without prompt")
+
+    # logout
+    subparsers.add_parser("logout", help="Log out current active session")
+
+    args = parser.parse_args()
+
+    commands = {
+        "current": cmd_current,
+        "list": cmd_list,
+        "new": cmd_new,
+        "rename": cmd_rename,
+        "save": cmd_save,
+        "use": cmd_use,
+        "remove": cmd_remove,
+        "logout": cmd_logout,
+        "export": cmd_export,
+        "import": cmd_import,
+    }
+
+    commands[args.command](args)
+
+if __name__ == "__main__":
+    main()

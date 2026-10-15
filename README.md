@@ -1,9 +1,9 @@
 # Antigravity Profile Switcher (`agy-auth`)
 
-A production-grade CLI tool to manage, switch, and secure multiple accounts and profiles for the Antigravity CLI (`agy`) on Linux and macOS.
+A production-grade CLI tool to manage, switch, and secure multiple accounts and profiles for the Antigravity CLI (`agy`) on Linux, macOS, and Windows.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Platform: Linux / macOS](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-blue.svg)]()
+[![Platform: Linux | macOS | Windows](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)]()
 [![Python: 3.x](https://img.shields.io/badge/Python-3.x-green.svg)]()
 
 ---
@@ -11,7 +11,8 @@ A production-grade CLI tool to manage, switch, and secure multiple accounts and 
 ## ✨ Features
 
 - 🔄 **Seamless Profile Switching**: Switch between multiple Antigravity sessions instantly.
-- 🎮 **Interactive Menu**: Run `agy-auth use` without arguments to choose profiles via a numeric selector.
+- 💬 **Conversation Portability**: Export, import, and resume full conversation sessions across different machines without losing context or brain artifacts.
+- 🎮 **Interactive Menu**: Run `agy-auth use` or `agy-auth conv export` without arguments to choose via an interactive selector.
 - ⚡ **Streamlined Account Creation**: Run `agy-auth new <name>` to automatically backup current session, trigger fresh login, and save under a new profile in a single step.
 - 🏷️ **Rename Profiles**: Easily rename profiles (`agy-auth rename old new`) without losing credentials.
 - 🔒 **Security-First**: Enforces strict POSIX permissions (`0600` for token files, `0700` for directories).
@@ -21,18 +22,33 @@ A production-grade CLI tool to manage, switch, and secure multiple accounts and 
 
 ---
 
-## 🚀 Quick Install (One-Liner)
+## 🚀 Installation & Setup
 
-Install or update `agy-auth` on any Linux/macOS machine with a single command:
-
+### Linux / macOS (One-Liner)
 ```bash
 mkdir -p ~/.local/bin && curl -fsSL https://raw.githubusercontent.com/iampingz/agy-auth/main/agy-auth -o ~/.local/bin/agy-auth && chmod +x ~/.local/bin/agy-auth
 ```
-
 > **Note:** Ensure `~/.local/bin` is in your shell `$PATH`. If not, add this to your `~/.bashrc` or `~/.zshrc`:
 > ```bash
 > echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
 > ```
+
+### Windows (PowerShell)
+1. Download `agy-auth` to a folder in your user directory (e.g. `C:\Users\<YourUser>\bin`):
+```powershell
+New-Item -ItemType Directory -Force -Path "$HOME\bin" | Out-Null
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/iampingz/agy-auth/main/agy-auth" -OutFile "$HOME\bin\agy-auth"
+```
+2. Create a batch wrapper or alias to run it directly:
+```powershell
+# Create agy-auth.cmd wrapper
+Set-Content -Path "$HOME\bin\agy-auth.cmd" -Value "@python `"%~dp0\agy-auth`" %*"
+```
+3. Add `$HOME\bin` to your User PATH if not already present:
+```powershell
+[Environment]::SetEnvironmentVariable("PATH", $env:PATH + ";$HOME\bin", [EnvironmentVariableTarget]::User)
+```
+*(Or simply run `python path\to\agy-auth <command>` directly)*
 
 ---
 
@@ -51,6 +67,11 @@ mkdir -p ~/.local/bin && curl -fsSL https://raw.githubusercontent.com/iampingz/a
 | `agy-auth import <file>` | Imports profiles from an exported JSON or token file. |
 | `agy-auth remove <name>` | Deletes a saved profile (prompts confirmation if currently active). |
 | `agy-auth logout` | Clears the active session token. |
+| `agy-auth conv list` | Lists recent conversation histories with IDs, titles, and timestamps. |
+| `agy-auth conv export [id]` | Exports a conversation (DB + Brain artifacts) into a portable `.agyconv` package. |
+| `agy-auth conv import <file>` | Safely imports a conversation package into the target machine (merges without deleting existing chats). |
+| `agy-auth conv resume [id]` | Resumes a conversation directly using `agy --conversation <id>`. |
+
 
 ---
 
@@ -141,7 +162,58 @@ agy-auth import work-profile.json --as-name office-work
 agy-auth import my-profiles.json -f
 ```
 
+### 8. Conversation Management (Cross-Machine Migration)
+
+Antigravity saves chat sessions in SQLite databases (`~/.gemini/antigravity-cli/conversations/<id>.db`), summaries index (`conversation_summaries.db`), and brain artifacts/transcripts (`brain/<id>/`). 
+
+`agy-auth conv` allows you to bundle, migrate, and resume conversations on any other machine (Linux, macOS, Windows) seamlessly:
+
+#### A. List Recent Conversations
+Inspect recent conversations along with titles, timestamps, and conversation IDs:
+```bash
+agy-auth conv list
+# Or specify how many conversations to display
+agy-auth conv list -n 30
+```
+
+#### B. Export Conversation Package (`.agyconv`)
+Create an encrypted/compressed `.agyconv` package containing the conversation database, brain logs/artifacts, and summary metadata:
+```bash
+# Interactive mode (displays numbered picker to choose conversation):
+agy-auth conv export
+
+# Export the latest conversation session:
+agy-auth conv export --last
+
+# Export specific conversation ID to custom path:
+agy-auth conv export <conversation-id> -o my-chat.agyconv
+```
+
+#### C. Import Conversation on Target Machine (Append & Merge)
+Copy the `.agyconv` file to another computer (or Windows / Linux environment) and run:
+```bash
+agy-auth conv import my-chat.agyconv
+
+# Force overwrite if conversation ID already exists on target machine
+agy-auth conv import my-chat.agyconv -f
+```
+> **Safety Guarantee:** Importing **appends** into `conversation_summaries.db` without deleting or modifying your existing conversation history on the target machine. If the conversation ID already exists, it prompts for confirmation before overwriting.
+
+#### D. Resume Conversation
+Resume the conversation right where you left off:
+```bash
+# Using agy-auth shortcut:
+agy-auth conv resume <conversation-id>
+
+# Or resume the latest imported/active session:
+agy-auth conv resume --last
+
+# Or native agy CLI command:
+agy --conversation <conversation-id>
+```
+
 ---
+
 
 ## ❓ Token Expiration & Refreshing
 

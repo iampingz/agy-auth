@@ -13,13 +13,20 @@ import base64
 import shutil
 import argparse
 import subprocess
+import sqlite3
+import tarfile
+import tempfile
 from datetime import datetime
 
 GEMINI_DIR = os.path.expanduser("~/.gemini/antigravity-cli")
 TOKEN_FILE = os.path.join(GEMINI_DIR, "antigravity-oauth-token")
 PROFILES_DIR = os.path.join(GEMINI_DIR, "profiles")
+CONVERSATIONS_DIR = os.path.join(GEMINI_DIR, "conversations")
+SUMMARIES_DB = os.path.join(GEMINI_DIR, "conversation_summaries.db")
+BRAIN_DIR = os.path.join(GEMINI_DIR, "brain")
 
 NAME_REGEX = re.compile(r"^[a-zA-Z0-9_\-\.]+$")
+UUID_REGEX = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 def validate_name(name):
     if not name or not NAME_REGEX.match(name) or name in (".", ".."):
@@ -500,9 +507,304 @@ def cmd_import(args):
     print("=" * 65)
     print(f"\033[1;32mImport finished: {imported_count} profile(s) imported successfully.\033[0m\n")
 
+def get_summaries_db_conn():
+    if not os.path.isfile(SUMMARIES_DB):
+        return None
+    return sqlite3.connect(SUMMARIES_DB)
+
+def list_recent_conversations(limit=20):
+    conn = get_summaries_db_conn()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT conversation_id, title, preview, last_modified_time, workspace_uris
+            FROM conversation_summaries
+            ORDER BY last_modified_time DESC
+            LIMIT ?
+        """, (limit,))
+        return cur.fetchall()
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+def cmd_conv_list(args):
+    rows = list_recent_conversations(limit=getattr(args, "limit", 20) or 20)
+    print("\n" + "=" * 90)
+    print(" \033[1mRecent Antigravity Conversations\033[0m")
+    print("=" * 90)
+    if not rows:
+        print("  (No conversations found)")
+    else:
+        for idx, (cid, title, preview, last_mod, ws_uris) in enumerate(rows, 1):
+            short_title = (title or "Untitled")[:40]
+            time_str = str(last_mod)[:19] if last_mod else "Unknown"
+            print(f"  [{idx:2d}] \033[1m{cid}\033[0m")
+            print(f"       \033[36mTitle:\033[0m {short_title}  \033[33m| Time:\033[0m {time_str}")
+            if preview:
+                short_prev = preview.replace("\n", " ").strip()[:70]
+                print(f"       \033[90mPreview: {short_prev}...\033[0m")
+            print()
+    print("=" * 90)
+
+def cmd_conv_export(args):
+    conn = get_summaries_db_conn()
+    if not conn:
+        print(f"\033[1;31mError: Conversation database not found at {SUMMARIES_DB}\033[0m")
+        sys.exit(1)
+
+    cid = None
+    if getattr(args, "last", False):
+        rows = list_recent_conversations(limit=1)
+        if not rows:
+            print("\033[1;31mError: No conversation found to export.\033[0m")
+            sys.exit(1)
+        cid = rows[0][0]
+    elif getattr(args, "id", None):
+        cid = args.id.strip()
+    else:
+        # Interactive selector
+        rows = list_recent_conversations(limit=10)
+        if not rows:
+            print("\033[1;31mError: No conversations found to export.\033[0m")
+            sys.exit(1)
+        print("\nSelect conversation to export:")
+        for idx, (c_id, title, preview, last_mod, _) in enumerate(rows, 1):
+            t_str = (title or "Untitled")[:45]
+            time_str = str(last_mod)[:19] if last_mod else ""
+            print(f"  [{idx}] \033[1m{c_id}\033[0m - {t_str} ({time_str})")
+        print()
+        try:
+            choice = input("Enter number or Conversation ID (or 'q' to cancel): ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelled.")
+            sys.exit(0)
+        if not choice or choice.lower() == 'q':
+            print("Cancelled.")
+            sys.exit(0)
+        if choice.isdigit() and 1 <= int(choice) <= len(rows):
+            cid = rows[int(choice) - 1][0]
+        else:
+            cid = choice
+
+    # Validate conversation DB exists
+    conv_db_path = os.path.join(CONVERSATIONS_DIR, f"{cid}.db")
+    if not os.path.isfile(conv_db_path):
+        print(f"\033[1;31mError: Conversation database not found: {conv_db_path}\033[0m")
+        sys.exit(1)
+
+    # Fetch summary row
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(conversation_summaries)")
+    columns = [col[1] for col in cur.fetchall()]
+
+    cur.execute("SELECT * FROM conversation_summaries WHERE conversation_id = ?", (cid,))
+    row = cur.fetchone()
+    conn.close()
+
+    summary_dict = {}
+    if row:
+        for col_name, val in zip(columns, row):
+            if isinstance(val, (bytes, bytearray)):
+                summary_dict[col_name] = base64.b64encode(val).decode("utf-8")
+                summary_dict[f"_{col_name}_is_b64"] = True
+            else:
+                summary_dict[col_name] = val
+
+    manifest = {
+        "version": 1,
+        "format": "antigravity-conversation",
+        "conversation_id": cid,
+        "exported_at": datetime.now().isoformat(),
+        "summary": summary_dict
+    }
+
+    output_path = getattr(args, "output", None)
+    if not output_path:
+        safe_title = re.sub(r'[^a-zA-Z0-9_\-]', '_', (summary_dict.get("title") or "conversation"))[:25].strip('_')
+        output_path = f"agy-conv-{safe_title or 'session'}-{cid[:8]}.agyconv"
+
+    print(f"\nExporting conversation \033[1m{cid}\033[0m...")
+    brain_path = os.path.join(BRAIN_DIR, cid)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Write manifest
+        manifest_file = os.path.join(tmpdir, "manifest.json")
+        with open(manifest_file, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+
+        # Copy conv db
+        shutil.copy2(conv_db_path, os.path.join(tmpdir, f"{cid}.db"))
+
+        # Copy brain if exists
+        tmp_brain = os.path.join(tmpdir, "brain")
+        if os.path.isdir(brain_path):
+            shutil.copytree(brain_path, tmp_brain)
+
+        # Create tar.gz package
+        with tarfile.open(output_path, "w:gz") as tar:
+            tar.add(manifest_file, arcname="manifest.json")
+            tar.add(os.path.join(tmpdir, f"{cid}.db"), arcname=f"{cid}.db")
+            if os.path.isdir(tmp_brain):
+                tar.add(tmp_brain, arcname="brain")
+
+    file_size_kb = os.path.getsize(output_path) / 1024
+    print(f"\033[1;32m✓ Successfully exported conversation package:\033[0m \033[1m{output_path}\033[0m ({file_size_kb:.1f} KB)")
+    print(f"Title: {summary_dict.get('title', 'Untitled')}")
+    print(f"To import on another machine: \033[1m這agy-auth conv import {output_path}\033[0m\n".replace("這", ""))
+
+def cmd_conv_import(args):
+    filepath = args.file.strip()
+    if not os.path.isfile(filepath):
+        print(f"\033[1;31mError: File '{filepath}' does not exist.\033[0m")
+        sys.exit(1)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            with tarfile.open(filepath, "r:*") as tar:
+                tar.extractall(path=tmpdir)
+        except Exception as e:
+            print(f"\033[1;31mError extracting conversation package '{filepath}': {e}\033[0m")
+            sys.exit(1)
+
+        manifest_file = os.path.join(tmpdir, "manifest.json")
+        if not os.path.isfile(manifest_file):
+            print(f"\033[1;31mError: Invalid conversation package (manifest.json missing).\033[0m")
+            sys.exit(1)
+
+        with open(manifest_file, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+
+        cid = manifest.get("conversation_id")
+        if not cid:
+            print("\033[1;31mError: Invalid manifest (missing conversation_id).\033[0m")
+            sys.exit(1)
+
+        imported_db = os.path.join(tmpdir, f"{cid}.db")
+        if not os.path.isfile(imported_db):
+            print(f"\033[1;31mError: Missing database file '{cid}.db' in package.\033[0m")
+            sys.exit(1)
+
+        # Target paths
+        os.makedirs(CONVERSATIONS_DIR, exist_ok=True)
+        dest_db = os.path.join(CONVERSATIONS_DIR, f"{cid}.db")
+        dest_brain = os.path.join(BRAIN_DIR, cid)
+
+        if os.path.isfile(dest_db) and not getattr(args, "force", False):
+            print(f"\033[1;33mConversation '{cid}' already exists in this environment. Overwrite? [y/N]: \033[0m", end="")
+            try:
+                choice = input().strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                print("\nCancelled.")
+                sys.exit(0)
+            if choice not in ("y", "yes"):
+                print("Import cancelled.")
+                sys.exit(0)
+
+        # Copy conversation DB
+        shutil.copy2(imported_db, dest_db)
+
+        # Copy brain directory if exists
+        tmp_brain = os.path.join(tmpdir, "brain")
+        if os.path.isdir(tmp_brain):
+            if os.path.exists(dest_brain):
+                shutil.rmtree(dest_brain)
+            shutil.copytree(tmp_brain, dest_brain)
+
+        # Merge / Upsert into conversation_summaries.db
+        summary_dict = manifest.get("summary", {})
+        if summary_dict and os.path.isfile(SUMMARIES_DB):
+            conn = sqlite3.connect(SUMMARIES_DB)
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(conversation_summaries)")
+            existing_cols = {col[1] for col in cur.fetchall()}
+
+            cols_to_insert = []
+            vals_to_insert = []
+            for k, v in summary_dict.items():
+                if k.startswith("_"):
+                    continue
+                if k in existing_cols:
+                    cols_to_insert.append(k)
+                    if summary_dict.get(f"_{k}_is_b64"):
+                        vals_to_insert.append(base64.b64decode(v.encode("utf-8")))
+                    else:
+                        vals_to_insert.append(v)
+
+            if cols_to_insert:
+                placeholders = ", ".join(["?"] * len(cols_to_insert))
+                col_names = ", ".join([f"`{c}`" for c in cols_to_insert])
+                sql = f"INSERT OR REPLACE INTO conversation_summaries ({col_names}) VALUES ({placeholders})"
+                cur.execute(sql, vals_to_insert)
+                conn.commit()
+            conn.close()
+
+    title = summary_dict.get("title") or "Untitled"
+    print(f"\n\033[1;32m✓ Successfully imported conversation!\033[0m")
+    print(f"Conversation ID: \033[1m{cid}\033[0m")
+    print(f"Title: {title}")
+    print(f"\nTo resume this conversation, run:")
+    print(f"  \033[1;36magy-auth conv resume {cid}\033[0m")
+    print(f"  or: \033[1;36magy --conversation {cid}\033[0m\n")
+
+def cmd_conv_resume(args):
+    cid = None
+    if getattr(args, "last", False):
+        rows = list_recent_conversations(limit=1)
+        if not rows:
+            print("\033[1;31mError: No conversation found to resume.\033[0m")
+            sys.exit(1)
+        cid = rows[0][0]
+    elif getattr(args, "id", None):
+        cid = args.id.strip()
+    else:
+        rows = list_recent_conversations(limit=10)
+        if not rows:
+            print("\033[1;31mError: No conversations found to resume.\033[0m")
+            sys.exit(1)
+        print("\nSelect conversation to resume:")
+        for idx, (c_id, title, preview, last_mod, _) in enumerate(rows, 1):
+            t_str = (title or "Untitled")[:45]
+            time_str = str(last_mod)[:19] if last_mod else ""
+            print(f"  [{idx}] \033[1m{c_id}\033[0m - {t_str} ({time_str})")
+        print()
+        try:
+            choice = input("Enter number or Conversation ID (or 'q' to cancel): ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelled.")
+            sys.exit(0)
+        if not choice or choice.lower() == 'q':
+            print("Cancelled.")
+            sys.exit(0)
+        if choice.isdigit() and 1 <= int(choice) <= len(rows):
+            cid = rows[int(choice) - 1][0]
+        else:
+            cid = choice
+
+    conv_db = os.path.join(CONVERSATIONS_DIR, f"{cid}.db")
+    if not os.path.isfile(conv_db):
+        print(f"\033[1;31mError: Conversation database '{cid}.db' not found.\033[0m")
+        sys.exit(1)
+
+    agy_bin = shutil.which("agy") or shutil.which("agy.cmd") or shutil.which("agy.exe")
+    if not agy_bin:
+        print("\033[1;31mError: 'agy' command not found in PATH.\033[0m")
+        sys.exit(1)
+
+    print(f"\033[1;32mResuming conversation {cid}...\033[0m\n")
+    if sys.platform == "win32":
+        try:
+            sys.exit(subprocess.call([agy_bin, "--conversation", cid]))
+        except KeyboardInterrupt:
+            sys.exit(0)
+    else:
+        os.execv(agy_bin, [agy_bin, "--conversation", cid])
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Antigravity Profile Switcher CLI (agy-auth)",
+        description="Antigravity Profile Switcher & Conversation Manager CLI (agy-auth)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   agy-auth new work              # Create & login directly into 'work'
@@ -513,8 +815,15 @@ def main():
   agy-auth current               # Show current active account
   agy-auth remove old-profile    # Safely delete a profile
   agy-auth export -o backup.json # Export all profiles to a JSON file
-  agy-auth export work           # Export only 'work' profile
   agy-auth import backup.json    # Import profiles from JSON file
+
+Conversation Management:
+  agy-auth conv list             # List recent conversations
+  agy-auth conv export           # Interactively select conversation to export
+  agy-auth conv export --last    # Export most recent conversation
+  agy-auth conv export <id>      # Export specific conversation to package (.agyconv)
+  agy-auth conv import file.agyconv # Import conversation package
+  agy-auth conv resume [id]      # Resume conversation with agy
 """
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -562,6 +871,30 @@ def main():
     # logout
     subparsers.add_parser("logout", help="Log out current active session")
 
+    # conv (Conversation management)
+    p_conv = subparsers.add_parser("conv", help="Manage, export, import, and resume conversations")
+    conv_sub = p_conv.add_subparsers(dest="conv_command", required=True)
+
+    # conv list
+    p_conv_l = conv_sub.add_parser("list", help="List recent conversations")
+    p_conv_l.add_argument("-n", "--limit", type=int, default=20, help="Number of conversations to display (default: 20)")
+
+    # conv export
+    p_conv_e = conv_sub.add_parser("export", help="Export conversation package (.agyconv)")
+    p_conv_e.add_argument("id", nargs="?", default=None, help="Conversation ID to export (optional)")
+    p_conv_e.add_argument("--last", action="store_true", help="Export the most recent conversation")
+    p_conv_e.add_argument("-o", "--output", default=None, help="Output file path (.agyconv)")
+
+    # conv import
+    p_conv_i = conv_sub.add_parser("import", help="Import conversation package (.agyconv)")
+    p_conv_i.add_argument("file", help="Path to conversation package file")
+    p_conv_i.add_argument("-f", "--force", action="store_true", help="Overwrite without confirmation prompt")
+
+    # conv resume
+    p_conv_r = conv_sub.add_parser("resume", help="Resume a conversation with agy")
+    p_conv_r.add_argument("id", nargs="?", default=None, help="Conversation ID to resume (optional)")
+    p_conv_r.add_argument("--last", action="store_true", help="Resume the most recent conversation")
+
     args = parser.parse_args()
 
     commands = {
@@ -575,9 +908,16 @@ def main():
         "logout": cmd_logout,
         "export": cmd_export,
         "import": cmd_import,
+        "conv": lambda a: {
+            "list": cmd_conv_list,
+            "export": cmd_conv_export,
+            "import": cmd_conv_import,
+            "resume": cmd_conv_resume,
+        }[a.conv_command](a),
     }
 
     commands[args.command](args)
 
 if __name__ == "__main__":
     main()
+
